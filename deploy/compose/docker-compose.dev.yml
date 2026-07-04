@@ -1,0 +1,152 @@
+# billet — local dev backing services (O1: compose is the P1–P3 runtime).
+#
+# Scope: backing services ONLY (mvp.md §3.1). The 5 app services, the Nginx
+# gateway and the Next.js frontend are added in milestone A1.
+#
+# Decisions applied:
+#   D5  · database-per-service — 5 logical DBs in one Postgres, one role each,
+#         least privilege (see postgres/init/00-init-databases.sh)
+#   D6  · holds live in Redis (10-min TTL); keyspace expiry events enabled (§5.2)
+#   D10 · RabbitMQ is the broker
+#   O4  · every image pinned to an explicit version, never :latest
+#   O5  · no plaintext secrets in git — values come from .env (git-ignored);
+#         .env.example carries dev-only defaults. SOPS+age encryption is P2.
+#   O12 · security thread — ports bound to 127.0.0.1, no-new-privileges everywhere
+#
+# The only interface is the Makefile: make up · down · test · seed · logs
+name: billet
+
+x-hardening: &hardening
+  restart: unless-stopped
+  security_opt:
+    - no-new-privileges:true
+
+services:
+  # ── PostgreSQL 16 — 5 databases, one role per service (D5, §3.1) ──────────
+  postgres:
+    <<: *hardening
+    image: postgres:16.9-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:?set in .env}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set in .env}
+      POSTGRES_DB: ${POSTGRES_DB:-postgres}
+      # per-service role passwords, consumed by the init script (D5, O5)
+      AUTH_DB_PASSWORD: ${AUTH_DB_PASSWORD:?set in .env}
+      CATALOG_DB_PASSWORD: ${CATALOG_DB_PASSWORD:?set in .env}
+      BOOKING_DB_PASSWORD: ${BOOKING_DB_PASSWORD:?set in .env}
+      PAYMENT_DB_PASSWORD: ${PAYMENT_DB_PASSWORD:?set in .env}
+      TICKETS_DB_PASSWORD: ${TICKETS_DB_PASSWORD:?set in .env}
+    ports:
+      - "127.0.0.1:${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./postgres/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      # schema-aware: succeeds only once the init script has created tickets_db
+      # (the last DB provisioned), so A1 app services using
+      # `depends_on: {condition: service_healthy}` never race the bootstrap on a
+      # cold start (MN2). Superuser over the local socket needs no password.
+      test: ["CMD-SHELL", "psql -U \"$$POSTGRES_USER\" -d tickets_db -tAc 'SELECT 1' >/dev/null"]
+      interval: 5s
+      timeout: 5s
+      retries: 15
+      start_period: 10s
+    networks: [billet]
+
+  # ── Redis 7 — holds + availability counters (D6, §5.2, §3.4) ─────────────
+  redis:
+    <<: *hardening
+    image: redis:7.4-alpine
+    # notify-keyspace-events Ex → the hold-expiry listener (§5.2, rule 4).
+    # persistence off → Redis is the *derived* store, rebuildable from PG (§3.4).
+    # noeviction → availability counters must never be evicted under memory pressure.
+    command:
+      - redis-server
+      - --notify-keyspace-events
+      - "Ex"
+      - --save
+      - ""
+      - --appendonly
+      - "no"
+      - --maxmemory-policy
+      - "noeviction"
+    ports:
+      - "127.0.0.1:${REDIS_PORT:-6379}:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 3s
+    networks: [billet]
+
+  # ── RabbitMQ — broker for order.paid (D10) ───────────────────────────────
+  rabbitmq:
+    <<: *hardening
+    image: rabbitmq:3.13-management-alpine
+    environment:
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_DEFAULT_USER:?set in .env}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_DEFAULT_PASS:?set in .env}
+      RABBITMQ_DEFAULT_VHOST: ${RABBITMQ_DEFAULT_VHOST:-billet}
+    ports:
+      - "127.0.0.1:${RABBITMQ_PORT:-5672}:5672"         # AMQP
+      - "127.0.0.1:${RABBITMQ_MGMT_PORT:-15672}:15672"  # management UI
+    volumes:
+      - rabbitmqdata:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 10s
+      timeout: 10s
+      retries: 10
+      start_period: 30s
+    networks: [billet]
+
+  # ── MinIO — object store for ticket PDFs (§3.1 tickets) ──────────────────
+  minio:
+    <<: *hardening
+    image: minio/minio:RELEASE.2025-04-22T22-12-26Z
+    command: ["server", "/data", "--console-address", ":9001"]
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:?set in .env}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:?set in .env}
+    ports:
+      - "127.0.0.1:${MINIO_API_PORT:-9000}:9000"        # S3 API
+      - "127.0.0.1:${MINIO_CONSOLE_PORT:-9001}:9001"    # console
+    volumes:
+      - miniodata:/data
+    healthcheck:
+      # `mc` and a preconfigured `local` alias ship in the image; this is
+      # MinIO's own recommended readiness probe and gives A1 tickets a
+      # `service_healthy` to depend on (M1).
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 5s
+    networks: [billet]
+
+  # ── Mailhog — dev SMTP sink (§3.1) ───────────────────────────────────────
+  mailhog:
+    <<: *hardening
+    image: mailhog/mailhog:v1.0.1
+    ports:
+      - "127.0.0.1:${MAILHOG_SMTP_PORT:-1025}:1025"     # SMTP
+      - "127.0.0.1:${MAILHOG_UI_PORT:-8025}:8025"       # web UI + JSON API
+    healthcheck:
+      # busybox wget is in the image — gate on the HTTP UI/API being served (M1).
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:8025/ || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 3s
+    networks: [billet]
+
+networks:
+  billet:
+    name: billet
+    driver: bridge
+
+volumes:
+  pgdata:
+  rabbitmqdata:
+  miniodata:

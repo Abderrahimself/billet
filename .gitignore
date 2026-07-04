@@ -5,3 +5,8 @@ CLAUDE.md
 POST-MVP.md
 .claude/
 docs/reviews/
+
+# local env — real values never committed (O5); .env.example stays tracked
+.env
+.env.local
+.env.*.local
