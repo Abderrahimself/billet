@@ -121,6 +121,37 @@ else
   bad "mailhog: UI/API not responding"
 fi
 
+# 8) auth service: liveness + readiness (D8, §3.1) -------------------------
+AUTH="http://127.0.0.1:${AUTH_PORT:-8001}"
+if retry_http "$AUTH/healthz"; then ok "auth: /healthz"; else bad "auth: /healthz not responding"; fi
+if retry_http "$AUTH/readyz"; then ok "auth: /readyz (auth_db reachable)"; else bad "auth: /readyz not 200"; fi
+
+# 9) auth JWKS + signup→/me round-trip: proves RS256 verifies end to end ----
+if command -v curl >/dev/null 2>&1; then
+  jwks=$(curl -fsS --max-time 5 "$AUTH/.well-known/jwks.json" 2>/dev/null || true)
+  case "$jwks" in
+    *'"kty"'*'"RSA"'* | *'"kty":"RSA"'*) ok "auth: JWKS serves an RSA signing key" ;;
+    *) bad "auth: JWKS missing RSA key [$jwks]" ;;
+  esac
+
+  email="smoke+$(date +%s)@example.com"
+  body=$(curl -fsS --max-time 5 -H 'Content-Type: application/json' \
+    -d "{\"email\":\"$email\",\"password\":\"smokepassword123\",\"display_name\":\"Smoke\"}" \
+    "$AUTH/api/auth/signup" 2>/dev/null || true)
+  access=$(printf '%s' "$body" | sed -n 's/.*"access_token":"\([^"]*\)".*/\1/p')
+  if [ -n "$access" ]; then
+    me=$(curl -fsS --max-time 5 -H "Authorization: Bearer $access" "$AUTH/api/auth/me" 2>/dev/null || true)
+    case "$me" in
+      *"$email"*) ok "auth: signup→/me round-trip (token verified)" ;;
+      *) bad "auth: /me did not return the new user [$me]" ;;
+    esac
+  else
+    bad "auth: signup returned no access_token [$body]"
+  fi
+else
+  echo "  -- skip auth JWKS + round-trip (curl not installed)"
+fi
+
 echo "==========================================================="
 printf 'smoke: %d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]

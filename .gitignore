@@ -10,3 +10,15 @@ docs/reviews/
 .env
 .env.local
 .env.*.local
+
+# dev signing keys and any PEM material — never committed (O5)
+secrets/
+*.pem
+
+# Python (services/*)
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/

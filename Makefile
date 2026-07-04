@@ -10,7 +10,9 @@ COMPOSE      := docker compose --env-file $(ENV_FILE) -f $(COMPOSE_FILE)
 SMOKE        := deploy/compose/scripts/smoke.sh
 
 .DEFAULT_GOAL := help
-.PHONY: help up down test seed logs smoke ps nuke
+.PHONY: help up down test seed logs smoke ps nuke gen-jwt-keys
+
+JWT_KEY := secrets/jwt_dev.pem
 
 help: ## show this help
 	@grep -hE '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) \
@@ -20,7 +22,14 @@ $(ENV_FILE):
 	@cp .env.example $(ENV_FILE) \
 	  && echo "created $(ENV_FILE) from .env.example (dev defaults — edit as needed)"
 
-up: $(ENV_FILE) ## start backing services, wait for health, run smoke
+gen-jwt-keys: $(JWT_KEY) ## generate the dev RS256 signing key (O5, git-ignored)
+$(JWT_KEY):
+	@mkdir -p secrets \
+	  && openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 -out $(JWT_KEY) \
+	  && chmod 600 $(JWT_KEY) \
+	  && echo "generated $(JWT_KEY) (dev-only, git-ignored — never commit)"
+
+up: $(ENV_FILE) gen-jwt-keys ## start the stack, wait for health, run smoke
 	$(COMPOSE) up -d --wait
 	@$(SHELL) $(SMOKE)
 
