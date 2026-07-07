@@ -175,6 +175,37 @@ services:
       start_period: 20s
     networks: [billet]
 
+  # ── catalog — events, tiers (definitions); verifies auth JWTs via JWKS (D1, D8) ─
+  catalog:
+    <<: *hardening
+    build:
+      context: ../../services/catalog
+      dockerfile: Dockerfile
+    image: billet/catalog:dev
+    depends_on:
+      postgres:
+        condition: service_healthy   # schema-aware: catalog_db exists before we migrate
+      auth:
+        condition: service_healthy   # auth up first so its JWKS is reachable (D8)
+    environment:
+      # DSN assembled from the existing per-service password (D5, O5) — catalog_db only
+      CATALOG_DATABASE_URL: postgresql+asyncpg://catalog:${CATALOG_DB_PASSWORD:?set in .env}@postgres:5432/catalog_db
+      # auth's public keys on the internal network; catalog verifies locally, no callback (D8)
+      CATALOG_AUTH_JWKS_URL: http://auth:8001/.well-known/jwks.json
+      CATALOG_AUTH_ISSUER: ${CATALOG_AUTH_ISSUER:-billet-auth}
+      CATALOG_LOG_LEVEL: ${CATALOG_LOG_LEVEL:-INFO}
+    ports:
+      # container port is fixed 8002; CATALOG_PORT only varies the host side.
+      # dev convenience; the gateway (later A1) will front /api/catalog and hide /internal
+      - "127.0.0.1:${CATALOG_PORT:-8002}:8002"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8002/healthz', timeout=3).status==200 else 1)"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 20s
+    networks: [billet]
+
 networks:
   billet:
     name: billet

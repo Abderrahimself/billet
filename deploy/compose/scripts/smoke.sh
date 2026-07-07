@@ -152,6 +152,57 @@ else
   echo "  -- skip auth JWKS + round-trip (curl not installed)"
 fi
 
+# 10) catalog service: liveness + readiness (D1, §3.1) ---------------------
+CATALOG="http://127.0.0.1:${CATALOG_PORT:-8002}"
+if retry_http "$CATALOG/healthz"; then ok "catalog: /healthz"; else bad "catalog: /healthz not responding"; fi
+if retry_http "$CATALOG/readyz"; then ok "catalog: /readyz (catalog_db reachable)"; else bad "catalog: /readyz not 200"; fi
+
+# 11) auth→catalog: an auth-minted token is accepted by catalog, verified via
+#     JWKS — the first proof of D8 across a service boundary. Then the full
+#     organizer flow: draft → tier → publish → public read → internal read. ----
+if command -v curl >/dev/null 2>&1; then
+  org="org+$(date +%s)@example.com"
+  reg=$(curl -fsS --max-time 5 -H 'Content-Type: application/json' \
+    -d "{\"email\":\"$org\",\"password\":\"smokepassword123\",\"display_name\":\"Organizer\"}" \
+    "$AUTH/api/auth/signup" 2>/dev/null || true)
+  tok=$(printf '%s' "$reg" | sed -n 's/.*"access_token":"\([^"]*\)".*/\1/p')
+  if [ -z "$tok" ]; then
+    bad "catalog: could not obtain an auth token [$reg]"
+  else
+    ev=$(curl -fsS --max-time 5 -H "Authorization: Bearer $tok" -H 'Content-Type: application/json' \
+      -d '{"title":"Jazz au Studio des Arts","description":"Une soiree jazz.","venue_name":"Studio des Arts","venue_city":"Casablanca","starts_at":"2030-01-01T20:00:00Z"}' \
+      "$CATALOG/api/catalog/events" 2>/dev/null || true)
+    eid=$(printf '%s' "$ev" | sed -n 's/.*"id":"\([^"]*\)".*/\1/p')
+    slug=$(printf '%s' "$ev" | sed -n 's/.*"slug":"\([^"]*\)".*/\1/p')
+    if [ -z "$eid" ]; then
+      bad "catalog: event creation returned no id [$ev]"
+    else
+      ok "catalog: organizer created a draft event (auth token verified via JWKS)"
+      tier=$(curl -fsS --max-time 5 -H "Authorization: Bearer $tok" -H 'Content-Type: application/json' \
+        -d '{"name":"Standard","price_cent":15000,"quantity":100,"max_per_order":4,"sale_starts_at":"2029-01-01T00:00:00Z","sale_ends_at":"2030-01-01T19:00:00Z"}' \
+        "$CATALOG/api/catalog/events/$eid/tiers" 2>/dev/null || true)
+      tid=$(printf '%s' "$tier" | sed -n 's/.*"id":"\([^"]*\)".*/\1/p')
+      pub=$(curl -fsS --max-time 5 -o /dev/null -w '%{http_code}' -X POST \
+        -H "Authorization: Bearer $tok" "$CATALOG/api/catalog/events/$eid/publish" 2>/dev/null || true)
+      if [ "$pub" = "200" ]; then ok "catalog: draft → published"; else bad "catalog: publish returned $pub"; fi
+      if check_http "$CATALOG/api/catalog/events/$slug"; then
+        ok "catalog: public event detail by slug"
+      else
+        bad "catalog: public detail by slug failed"
+      fi
+      # /internal is reachable directly only because the gateway does not exist
+      # yet; once it lands, this path is off the public edge (D3, §3.2 r2).
+      if [ -n "$tid" ] && check_http "$CATALOG/internal/tiers/$tid"; then
+        ok "catalog: GET /internal/tiers/{id} (booking's read path)"
+      else
+        bad "catalog: internal tier lookup failed"
+      fi
+    fi
+  fi
+else
+  echo "  -- skip catalog auth round-trip (curl not installed)"
+fi
+
 echo "==========================================================="
 printf 'smoke: %d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]
