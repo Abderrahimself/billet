@@ -203,6 +203,56 @@ else
   echo "  -- skip catalog auth round-trip (curl not installed)"
 fi
 
+# 12) gateway: the single public origin — routing, D3 isolation, edge rate limit
+GATEWAY="http://127.0.0.1:${GATEWAY_PORT:-8080}"
+if retry_http "$GATEWAY/healthz"; then ok "gateway: /healthz"; else bad "gateway: /healthz not responding"; fi
+
+if command -v curl >/dev/null 2>&1; then
+  # routing: the full organizer flow through the ONE origin (:8080) -----------
+  gorg="gw+$(date +%s)@example.com"
+  greg=$(curl -fsS --max-time 5 -H 'Content-Type: application/json' \
+    -d "{\"email\":\"$gorg\",\"password\":\"smokepassword123\",\"display_name\":\"GW Organizer\"}" \
+    "$GATEWAY/api/auth/signup" 2>/dev/null || true)
+  gtok=$(printf '%s' "$greg" | sed -n 's/.*"access_token":"\([^"]*\)".*/\1/p')
+  if [ -z "$gtok" ]; then
+    bad "gateway: signup via /api/auth failed [$greg]"
+  else
+    ok "gateway: routes /api/auth → auth (signup through the edge)"
+    gev=$(curl -fsS --max-time 5 -H "Authorization: Bearer $gtok" -H 'Content-Type: application/json' \
+      -d '{"title":"Gateway Gala","description":"Via the edge.","venue_name":"Grand Theatre","venue_city":"Rabat","starts_at":"2030-02-01T20:00:00Z"}' \
+      "$GATEWAY/api/catalog/events" 2>/dev/null || true)
+    geid=$(printf '%s' "$gev" | sed -n 's/.*"id":"\([^"]*\)".*/\1/p')
+    if [ -n "$geid" ]; then
+      ok "gateway: routes /api/catalog → catalog (event created through the edge)"
+    else
+      bad "gateway: event creation via /api/catalog failed [$gev]"
+    fi
+  fi
+
+  # D3 isolation: JWKS and /internal must NOT be reachable at the edge (§3.2 r2).
+  # No -f: we want the real status code even when it is a 404.
+  code_jwks=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 5 "$GATEWAY/.well-known/jwks.json" 2>/dev/null || echo 000)
+  if [ "$code_jwks" = "404" ]; then ok "gateway: JWKS blocked at the edge (404, D3)"; else bad "gateway: JWKS via gateway returned $code_jwks (must be 404)"; fi
+  code_int=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 5 "$GATEWAY/internal/tiers/00000000-0000-0000-0000-000000000000" 2>/dev/null || echo 000)
+  if [ "$code_int" = "404" ]; then ok "gateway: /internal blocked at the edge (404, D3)"; else bad "gateway: /internal via gateway returned $code_int (must be 404)"; fi
+
+  # ...and the same JWKS is still served DIRECTLY on the service network, so the
+  # gateway hides it from the edge without breaking inter-service verification.
+  if check_http "$AUTH/.well-known/jwks.json"; then ok "gateway: JWKS still reachable directly (auth:8001) — hiding is edge-only"; else bad "gateway: JWKS unreachable directly — hiding broke it"; fi
+
+  # edge rate limit: 5 login/min/IP → a rapid burst must yield at least one 429 (§9)
+  limited=0; i=0
+  while [ "$i" -lt 15 ]; do
+    rc=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 5 -H 'Content-Type: application/json' \
+      -d "{\"email\":\"$gorg\",\"password\":\"wrongpw\"}" "$GATEWAY/api/auth/login" 2>/dev/null || echo 000)
+    [ "$rc" = "429" ] && limited=1
+    i=$((i + 1))
+  done
+  if [ "$limited" = "1" ]; then ok "gateway: login rate limit enforced (429 under burst, §9)"; else bad "gateway: no 429 under 15 rapid logins — rate limit not enforced"; fi
+else
+  echo "  -- skip gateway routing/isolation/rate-limit checks (curl not installed)"
+fi
+
 echo "==========================================================="
 printf 'smoke: %d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]

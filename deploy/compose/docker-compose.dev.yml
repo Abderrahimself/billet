@@ -206,6 +206,31 @@ services:
       start_period: 20s
     networks: [billet]
 
+  # ── gateway — Nginx single public origin; fronts /api/*, hides /internal + JWKS (D3, §3.2) ─
+  gateway:
+    <<: *hardening
+    # non-root image (uid 101) that binds :8080 by default (O4 pinned, O12 non-root).
+    # No build: the routing table is mounted read-only, like postgres/init.
+    image: nginxinc/nginx-unprivileged:1.27.4-alpine
+    depends_on:
+      auth:
+        condition: service_healthy       # up before we resolve its upstream + JWKS
+      catalog:
+        condition: service_healthy
+    volumes:
+      - ./gateway/default.conf:/etc/nginx/conf.d/default.conf:ro
+    ports:
+      # the one public origin (D3). Auth/catalog keep their own loopback ports for
+      # dev debugging and for the smoke checks the gateway deliberately never routes.
+      - "127.0.0.1:${GATEWAY_PORT:-8080}:8080"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:8080/healthz || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 5s
+    networks: [billet]
+
 networks:
   billet:
     name: billet
